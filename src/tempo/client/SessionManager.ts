@@ -199,8 +199,12 @@ export function sessionManager(parameters: sessionManager.Parameters): SessionMa
       throw new Error('No request context available — call fetch() or sse() before open().')
     }
 
-    const { body: _body, duplex: _duplex, method: _method, ...requestInit } =
-      (lastRequest.init ?? {}) as RequestInit & { duplex?: string }
+    const {
+      body: _body,
+      duplex: _duplex,
+      method: _method,
+      ...requestInit
+    } = (lastRequest.init ?? {}) as RequestInit & { duplex?: string }
 
     return {
       input: lastRequest.input,
@@ -230,7 +234,10 @@ export function sessionManager(parameters: sessionManager.Parameters): SessionMa
         title?: string | undefined
         type?: string | undefined
       }
-      text = [text, parsed.detail, parsed.title, parsed.type].filter(Boolean).join(' ').toLowerCase()
+      text = [text, parsed.detail, parsed.title, parsed.type]
+        .filter(Boolean)
+        .join(' ')
+        .toLowerCase()
     } catch {}
 
     return (

@@ -536,7 +536,10 @@ async function handleSseStream(
             escrowContract: opts.escrowContract,
             chainId: opts.chainId,
           })
-          await globalThis.fetch(opts.fetchUrl, buildFollowUpRequestInit(opts.fetchInit, voucherCred))
+          await globalThis.fetch(
+            opts.fetchUrl,
+            buildFollowUpRequestInit(opts.fetchInit, voucherCred),
+          )
         } catch (e) {
           opts.info(pc.dim(pc.yellow(` [voucher failed: ${e instanceof Error ? e.message : e}]`)))
         }
@@ -680,7 +683,12 @@ async function closeChannel(opts: {
 }
 
 function buildFollowUpRequestInit(fetchInit: RequestInit, credential: string): RequestInit {
-  const { body: _body, duplex: _duplex, method: _method, ...requestInit } = fetchInit as RequestInit & {
+  const {
+    body: _body,
+    duplex: _duplex,
+    method: _method,
+    ...requestInit
+  } = fetchInit as RequestInit & {
     duplex?: string
   }
   return {

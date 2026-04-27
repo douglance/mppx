@@ -231,7 +231,10 @@ export function normalizeHeaders(headers: unknown): Record<string, string> {
 }
 
 /** @internal */
-export function withAuthorizationHeader(headers: unknown, credential: string): Record<string, string> {
+export function withAuthorizationHeader(
+  headers: unknown,
+  credential: string,
+): Record<string, string> {
   const normalized = normalizeHeaders(headers)
   const existingSchemes: string[] = []
 
