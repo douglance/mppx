@@ -37,6 +37,7 @@ export default defineConfig({
         functions: 70,
       },
     },
+    globalSetup: ['./test/setup.global.ts'],
     projects: [
       {
         test: {
@@ -52,7 +53,6 @@ export default defineConfig({
           typecheck: {
             include: ['src/**/*.test-d.ts'],
           },
-          globalSetup: ['./test/setup.global.ts'],
           globals: true,
           retry: 3,
           setupFiles: ['./test/setup.ts'],
@@ -65,7 +65,6 @@ export default defineConfig({
           name: 'cli',
           alias,
           include: ['src/cli/**/*.test.ts'],
-          globalSetup: ['./test/setup.global.ts'],
           globals: true,
           retry: 3,
           setupFiles: ['./test/setup.ts'],
