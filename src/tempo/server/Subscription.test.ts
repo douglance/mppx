@@ -319,6 +319,100 @@ describe('tempo.subscription', () => {
     expect(await subscriptions.getByKey(subscriptionKey)).toBe(null)
   })
 
+  test('rejects activation settlements with a mismatched chainId', async () => {
+    const store = Store.memory()
+    const subscriptions = SubscriptionStore.fromStore(store)
+    const method = subscription({
+      accessKey: async () => accessKey,
+      activate: async ({ request, resolved }) => ({
+        receipt: createReceipt('sub_bad', hashActivate),
+        subscription: createRecord({
+          amount: request.amount,
+          chainId: chainId + 1,
+          currency: request.currency,
+          lookupKey: resolved.key,
+          periodSeconds: request.periodSeconds,
+          recipient: request.recipient,
+          reference: hashActivate,
+          subscriptionExpires: request.subscriptionExpires,
+          subscriptionId: 'sub_bad',
+        }),
+      }),
+      amount: subscriptionAmount,
+      chainId,
+      currency: subscriptionCurrency,
+      periodSeconds: subscriptionPeriodSeconds,
+      recipient: subscriptionRecipient,
+      resolve: async () => ({ key: subscriptionKey }),
+      store,
+      subscriptionExpires: activeSubscriptionExpires,
+    })
+    const mppx = Mppx.create({ methods: [method], realm, secretKey })
+    const challengeResult = await mppx.tempo.subscription({})(
+      new Request('https://example.com/resource'),
+    )
+    if (challengeResult.status !== 402) throw new Error('expected activation challenge')
+
+    const challenge = Challenge.fromResponse(challengeResult.challenge)
+    const credential = await createCredential(challenge)
+    const rejected = await mppx.tempo.subscription({})(
+      new Request('https://example.com/resource', {
+        headers: { Authorization: Credential.serialize(credential) },
+      }),
+    )
+
+    expect(rejected.status).toBe(402)
+    expect(await subscriptions.getByKey(subscriptionKey)).toBe(null)
+  })
+
+  test('rejects activation settlements with a mismatched externalId', async () => {
+    const store = Store.memory()
+    const subscriptions = SubscriptionStore.fromStore(store)
+    const method = subscription({
+      accessKey: async () => accessKey,
+      activate: async ({ request, resolved }) => ({
+        receipt: createReceipt('sub_bad', hashActivate),
+        subscription: createRecord({
+          amount: request.amount,
+          chainId: request.methodDetails?.chainId,
+          currency: request.currency,
+          externalId: 'external_2',
+          lookupKey: resolved.key,
+          periodSeconds: request.periodSeconds,
+          recipient: request.recipient,
+          reference: hashActivate,
+          subscriptionExpires: request.subscriptionExpires,
+          subscriptionId: 'sub_bad',
+        }),
+      }),
+      amount: subscriptionAmount,
+      chainId,
+      currency: subscriptionCurrency,
+      externalId: 'external_1',
+      periodSeconds: subscriptionPeriodSeconds,
+      recipient: subscriptionRecipient,
+      resolve: async () => ({ key: subscriptionKey }),
+      store,
+      subscriptionExpires: activeSubscriptionExpires,
+    })
+    const mppx = Mppx.create({ methods: [method], realm, secretKey })
+    const challengeResult = await mppx.tempo.subscription({})(
+      new Request('https://example.com/resource'),
+    )
+    if (challengeResult.status !== 402) throw new Error('expected activation challenge')
+
+    const challenge = Challenge.fromResponse(challengeResult.challenge)
+    const credential = await createCredential(challenge)
+    const rejected = await mppx.tempo.subscription({})(
+      new Request('https://example.com/resource', {
+        headers: { Authorization: Credential.serialize(credential) },
+      }),
+    )
+
+    expect(rejected.status).toBe(402)
+    expect(await subscriptions.getByKey(subscriptionKey)).toBe(null)
+  })
+
   test('rejects credentials whose declared source does not match the key authorization signer', async () => {
     const store = Store.memory()
     const activateCalls: unknown[] = []

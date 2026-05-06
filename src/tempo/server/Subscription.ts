@@ -376,7 +376,9 @@ function assertSubscriptionRequestMatch(
 ) {
   const matches =
     subscription.amount === request.amount &&
+    subscription.chainId === request.methodDetails?.chainId &&
     subscription.currency.toLowerCase() === request.currency.toLowerCase() &&
+    subscription.externalId === request.externalId &&
     subscription.periodSeconds === request.periodSeconds &&
     subscription.recipient.toLowerCase() === request.recipient.toLowerCase() &&
     subscription.subscriptionExpires === request.subscriptionExpires

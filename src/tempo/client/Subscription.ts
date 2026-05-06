@@ -1,5 +1,5 @@
 import { KeyAuthorization } from 'ox/tempo'
-import type { Address } from 'viem'
+import { isAddressEqual, type Address } from 'viem'
 import { tempo as tempo_chain } from 'viem/chains'
 
 import * as Credential from '../../Credential.js'
@@ -87,7 +87,7 @@ export function subscription(parameters: subscription.Parameters = {}) {
         request: challenge.request,
       } as never)
 
-      verifySubscriptionKeyAuthorization({
+      const verified = verifySubscriptionKeyAuthorization({
         accessKey,
         chainId,
         payload: {
@@ -96,6 +96,9 @@ export function subscription(parameters: subscription.Parameters = {}) {
         },
         request: challenge.request,
       })
+      if (!isAddressEqual(verified.source.address, account.address)) {
+        throw new Error('keyAuthorization signer does not match the selected account')
+      }
 
       return Credential.serialize({
         challenge,
