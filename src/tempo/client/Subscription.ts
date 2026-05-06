@@ -1,7 +1,6 @@
 import { KeyAuthorization } from 'ox/tempo'
 import type { Address } from 'viem'
 import { tempo as tempo_chain } from 'viem/chains'
-import { Actions } from 'viem/tempo'
 
 import * as Credential from '../../Credential.js'
 import * as Method from '../../Method.js'
@@ -10,6 +9,13 @@ import * as Client from '../../viem/Client.js'
 import * as z from '../../zod.js'
 import * as defaults from '../internal/defaults.js'
 import * as Methods from '../Methods.js'
+import {
+  getSubscriptionRpcAllowedCalls,
+  signSubscriptionKeyAuthorization,
+  toSubscriptionExpirySeconds,
+  toSubscriptionPeriodSeconds,
+  verifySubscriptionKeyAuthorization,
+} from '../subscription/KeyAuthorization.js'
 import type { SubscriptionAccessKey } from '../subscription/Types.js'
 
 /** Context accepted by the Tempo subscription client method. */
@@ -37,10 +43,10 @@ export function subscription(parameters: subscription.Parameters = {}) {
       const chainId = challenge.request.methodDetails?.chainId ?? defaults.chainId.mainnet
       const client = await getClient({ chainId })
       const account = getAccount(client, context)
-      const accessKey = context?.accessKey ?? parameters.accessKey
+      const accessKey = context?.accessKey ?? parameters.accessKey ?? challenge.request.accessKey
       if (!accessKey) {
         throw new Error(
-          'No `accessKey` provided. Pass `accessKey` to parameters or context so the client knows which server key to authorize.',
+          'No `accessKey` provided. The subscription challenge must include `accessKey`, or the client must pass one to parameters/context.',
         )
       }
 
@@ -51,23 +57,45 @@ export function subscription(parameters: subscription.Parameters = {}) {
           throw new Error(`Unexpected subscription recipient: ${challenge.request.recipient}`)
         }
       }
-
-      const periodSeconds = Number(challenge.request.periodSeconds)
-      if (!Number.isSafeInteger(periodSeconds) || periodSeconds <= 0) {
-        throw new Error('Subscription `periodSeconds` must be a positive safe integer.')
+      if (parameters.expectedCurrencies) {
+        const currency = (challenge.request.currency as string).toLowerCase()
+        const allowed = parameters.expectedCurrencies.map((address) => address.toLowerCase())
+        if (!allowed.includes(currency)) {
+          throw new Error(`Unexpected subscription currency: ${challenge.request.currency}`)
+        }
       }
+      if (
+        parameters.expectedPeriodSeconds &&
+        challenge.request.periodSeconds !== parameters.expectedPeriodSeconds
+      ) {
+        throw new Error(`Unexpected subscription periodSeconds: ${challenge.request.periodSeconds}`)
+      }
+      if (
+        parameters.maxAmount !== undefined &&
+        BigInt(challenge.request.amount) > BigInt(parameters.maxAmount)
+      ) {
+        throw new Error(`Subscription amount exceeds maxAmount: ${challenge.request.amount}`)
+      }
+
+      toSubscriptionPeriodSeconds(challenge.request.periodSeconds)
+      toSubscriptionExpirySeconds(challenge.request.subscriptionExpires)
 
       const keyAuthorization = await authorizeAccessKey(client, {
         accessKey,
         account,
-        expiry: Math.floor(new Date(challenge.request.subscriptionExpires).getTime() / 1000),
-        limits: [
-          {
-            token: challenge.request.currency as Address,
-            limit: BigInt(challenge.request.amount),
-          },
-        ],
+        chainId,
+        request: challenge.request,
       } as never)
+
+      verifySubscriptionKeyAuthorization({
+        accessKey,
+        chainId,
+        payload: {
+          signature: KeyAuthorization.serialize(keyAuthorization as never),
+          type: 'keyAuthorization',
+        },
+        request: challenge.request,
+      })
 
       return Credential.serialize({
         challenge,
@@ -75,7 +103,7 @@ export function subscription(parameters: subscription.Parameters = {}) {
           signature: KeyAuthorization.serialize(keyAuthorization as never),
           type: 'keyAuthorization',
         },
-        source: `did:pkh:eip155:${chainId}:${account.address}`,
+        source: `did:pkh:eip155:${chainId}:${account.address.toLowerCase()}`,
       })
     },
   })
@@ -86,31 +114,38 @@ async function authorizeAccessKey(
   parameters: {
     accessKey: SubscriptionAccessKey
     account: Account.Account
-    expiry: number
-    limits: readonly {
-      token: Address
-      limit: bigint
-    }[]
+    chainId: number
+    request: Pick<
+      ReturnType<typeof Methods.subscription.schema.request.parse>,
+      'amount' | 'currency' | 'periodSeconds' | 'recipient' | 'subscriptionExpires'
+    >
   },
 ) {
-  const { accessKey, account, expiry, limits } = parameters
+  const { accessKey, account, chainId, request } = parameters
 
-  if (typeof account.signAuthorization === 'function')
-    return Actions.accessKey.signAuthorization(client, {
-      accessKey,
-      account,
-      expiry,
-      limits,
-    } as never)
+  const local = await signSubscriptionKeyAuthorization({
+    accessKey,
+    account,
+    chainId,
+    request,
+  })
+  if (local) return local
 
   const result = (await client.request({
     method: 'wallet_authorizeAccessKey',
     params: [
       {
         address: accessKey.accessKeyAddress,
-        expiry,
+        allowedCalls: getSubscriptionRpcAllowedCalls(request),
+        expiry: toSubscriptionExpirySeconds(request.subscriptionExpires),
         keyType: accessKey.keyType,
-        limits,
+        limits: [
+          {
+            token: request.currency as Address,
+            limit: BigInt(request.amount),
+            period: toSubscriptionPeriodSeconds(request.periodSeconds),
+          },
+        ],
       },
     ],
   } as never)) as {
@@ -125,6 +160,9 @@ export declare namespace subscription {
   type Parameters = Account.getResolver.Parameters &
     Client.getResolver.Parameters & {
       accessKey?: SubscriptionAccessKey | undefined
+      expectedCurrencies?: readonly Address[] | undefined
+      expectedPeriodSeconds?: string | undefined
       expectedRecipients?: readonly Address[] | undefined
+      maxAmount?: string | bigint | undefined
     }
 }

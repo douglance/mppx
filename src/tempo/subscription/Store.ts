@@ -6,14 +6,30 @@ const defaultKeyPrefix = 'tempo:subscription:key:'
 
 /** Subscription-aware wrapper around a generic key-value store. */
 export type SubscriptionStore = {
+  /** Atomically marks a subscription period as being renewed. */
+  beginRenewal: (subscriptionId: string, periodIndex: number) => Promise<BeginRenewalResult>
+  /** Atomically stores a successful renewal and clears the in-flight marker. */
+  commitRenewal: (subscription: SubscriptionRecord, periodIndex: number) => Promise<void>
+  /** Clears an in-flight renewal marker after a failed renewal attempt. */
+  failRenewal: (subscriptionId: string, periodIndex: number) => Promise<void>
+  /** Looks up a subscription by subscription ID. */
   get: (subscriptionId: string) => Promise<SubscriptionRecord | null>
+  /** Looks up the active subscription for a resolved request key. */
   getByKey: (key: string) => Promise<SubscriptionRecord | null>
+  /** Upserts a subscription record and marks it as active for its lookup key. */
   put: (record: SubscriptionRecord) => Promise<void>
 }
 
+/** Result from attempting to mark a subscription period as in-flight. */
+export type BeginRenewalResult =
+  | { status: 'started'; subscription: SubscriptionRecord }
+  | { status: 'charged'; subscription: SubscriptionRecord }
+  | { status: 'inFlight'; subscription: SubscriptionRecord }
+  | { status: 'missing' }
+
 /** Wraps a generic key-value {@link Store.Store} with subscription-specific accessors. */
 export function fromStore(
-  store: Store.Store<Record<string, unknown>>,
+  store: Store.AtomicStore<Record<string, unknown>>,
   options?: fromStore.Options,
 ): SubscriptionStore {
   const recordPrefix = options?.recordPrefix ?? defaultRecordPrefix
@@ -28,6 +44,80 @@ export function fromStore(
   }
 
   return {
+    async beginRenewal(subscriptionId, periodIndex) {
+      return store.update(
+        recordKey(subscriptionId),
+        (current): Store.Change<unknown, BeginRenewalResult> => {
+          const subscription = current as SubscriptionRecord | null
+          if (!subscription) return { op: 'noop', result: { status: 'missing' as const } }
+          if (subscription.lastChargedPeriod >= periodIndex) {
+            return {
+              op: 'noop',
+              result: { status: 'charged' as const, subscription },
+            }
+          }
+          if (subscription.inFlightPeriod === periodIndex) {
+            return {
+              op: 'noop',
+              result: { status: 'inFlight' as const, subscription },
+            }
+          }
+
+          const next = {
+            ...subscription,
+            inFlightPeriod: periodIndex,
+            inFlightStartedAt: new Date().toISOString(),
+          }
+          return {
+            op: 'set',
+            value: next,
+            result: { status: 'started' as const, subscription: next },
+          }
+        },
+      )
+    },
+
+    async commitRenewal(subscription, periodIndex) {
+      await store.update(recordKey(subscription.subscriptionId), (current) => {
+        const existing = current as SubscriptionRecord | null
+        if (!existing || existing.inFlightPeriod !== periodIndex) {
+          return { op: 'noop', result: undefined }
+        }
+
+        return {
+          op: 'set',
+          value: {
+            ...subscription,
+            inFlightPeriod: undefined,
+            inFlightReference: undefined,
+            inFlightStartedAt: undefined,
+            lastChargedPeriod: periodIndex,
+          },
+          result: undefined,
+        }
+      })
+      await store.put(lookupKey(subscription.lookupKey), subscription.subscriptionId)
+    },
+
+    async failRenewal(subscriptionId, periodIndex) {
+      await store.update(recordKey(subscriptionId), (current) => {
+        const subscription = current as SubscriptionRecord | null
+        if (!subscription || subscription.inFlightPeriod !== periodIndex) {
+          return { op: 'noop', result: undefined }
+        }
+        return {
+          op: 'set',
+          value: {
+            ...subscription,
+            inFlightPeriod: undefined,
+            inFlightReference: undefined,
+            inFlightStartedAt: undefined,
+          },
+          result: undefined,
+        }
+      })
+    },
+
     async get(subscriptionId) {
       return (await store.get(recordKey(subscriptionId))) as SubscriptionRecord | null
     },

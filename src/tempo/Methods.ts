@@ -16,6 +16,36 @@ const split = z.object({
   ),
 })
 
+const uint64Max = (1n << 64n) - 1n
+
+const normalizedAddress = z.pipe(
+  z.address(),
+  z.transform((value) => value.toLowerCase() as Address),
+)
+
+const subscriptionAccessKey = z.object({
+  accessKeyAddress: normalizedAddress,
+  keyType: z.enum(['p256', 'secp256k1', 'webAuthn']),
+})
+
+const uint64String = z.string().check(
+  z.regex(/^[1-9]\d*$/, 'Invalid periodSeconds'),
+  z.refine((value) => {
+    try {
+      return BigInt(value) <= uint64Max
+    } catch {
+      return false
+    }
+  }, 'periodSeconds exceeds uint64'),
+)
+
+function positiveParsedAmount(message: string) {
+  return z.refine((value) => {
+    const { amount, decimals } = value as { amount: string; decimals: number }
+    return parseUnits(amount, decimals) > 0n
+  }, message)
+}
+
 /**
  * Tempo charge intent for one-time TIP-20 token transfers.
  *
@@ -216,17 +246,20 @@ export const subscription = Method.from({
       }),
     },
     request: z.pipe(
-      z.object({
-        amount: z.amount(),
-        chainId: z.optional(z.number()),
-        currency: z.string(),
-        decimals: z.number(),
-        description: z.optional(z.string()),
-        externalId: z.optional(z.string()),
-        periodSeconds: z.string().check(z.regex(/^[1-9]\d*$/, 'Invalid periodSeconds')),
-        recipient: z.string(),
-        subscriptionExpires: z.datetime(),
-      }),
+      z
+        .object({
+          amount: z.amount(),
+          accessKey: z.optional(subscriptionAccessKey),
+          chainId: z.optional(z.number()),
+          currency: normalizedAddress,
+          decimals: z.number(),
+          description: z.optional(z.string()),
+          externalId: z.optional(z.string()),
+          periodSeconds: uint64String,
+          recipient: normalizedAddress,
+          subscriptionExpires: z.datetime(),
+        })
+        .check(positiveParsedAmount('Subscription amount must be greater than 0')),
       z.transform(({ amount, chainId, decimals, ...rest }) => ({
         ...rest,
         amount: parseUnits(amount, decimals).toString(),

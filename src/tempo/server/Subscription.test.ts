@@ -1,19 +1,47 @@
 import { Challenge, Credential, Receipt } from 'mppx'
 import { Mppx } from 'mppx/server'
+import { KeyAuthorization } from 'ox/tempo'
+import { privateKeyToAccount } from 'viem/accounts'
 import { describe, expect, test } from 'vp/test'
 
 import * as Store from '../../Store.js'
+import * as Methods from '../Methods.js'
+import { signSubscriptionKeyAuthorization } from '../subscription/KeyAuthorization.js'
 import * as SubscriptionStore from '../subscription/Store.js'
+import type { SubscriptionAccessKey } from '../subscription/Types.js'
 import type { SubscriptionRecord } from '../subscription/Types.js'
-import { charge, subscription } from './Subscription.js'
+import { renew, subscription } from './Subscription.js'
 
 const realm = 'api.example.com'
 const secretKey = 'test-secret-key'
 const activeBillingAnchor = new Date().toISOString()
 const activeSubscriptionExpires = new Date(Date.now() + 365 * 24 * 60 * 60 * 1_000).toISOString()
+const chainId = 4217
+const subscriptionAmount = '10'
+const subscriptionCurrency = '0x20c0000000000000000000000000000000000001'
 const subscriptionKey = 'user-1:plan:pro'
+const subscriptionPeriodSeconds = '3600'
+const subscriptionRecipient = '0x1234567890abcdef1234567890abcdef12345678'
+const rootAccount = privateKeyToAccount(
+  '0x0000000000000000000000000000000000000000000000000000000000000001',
+)
+const accessAccount = privateKeyToAccount(
+  '0x0000000000000000000000000000000000000000000000000000000000000002',
+)
+const otherAccessAccount = privateKeyToAccount(
+  '0x0000000000000000000000000000000000000000000000000000000000000003',
+)
+const accessKey = {
+  accessKeyAddress: accessAccount.address,
+  keyType: 'secp256k1',
+} as const satisfies SubscriptionAccessKey
+const hashActivate = `0x${'a'.repeat(64)}`
+const hashRenewed = `0x${'b'.repeat(64)}`
+const hashStale = `0x${'c'.repeat(64)}`
+const hashBackground = `0x${'d'.repeat(64)}`
+const hashOld = `0x${'e'.repeat(64)}`
 
-function createReceipt(subscriptionId: string, reference = '0xreceipt') {
+function createReceipt(subscriptionId: string, reference = hashActivate) {
   return {
     method: 'tempo',
     reference,
@@ -27,13 +55,13 @@ function createRecord(overrides: Partial<SubscriptionRecord> = {}): Subscription
   return {
     amount: '10000000',
     billingAnchor: activeBillingAnchor,
-    chainId: 4217,
-    currency: '0x20c0000000000000000000000000000000000001',
+    chainId,
+    currency: subscriptionCurrency,
     lastChargedPeriod: 0,
     lookupKey: subscriptionKey,
-    periodSeconds: '3600',
-    recipient: '0x1234567890abcdef1234567890abcdef12345678',
-    reference: '0xsubscription',
+    periodSeconds: subscriptionPeriodSeconds,
+    recipient: subscriptionRecipient,
+    reference: hashActivate,
     subscriptionExpires: activeSubscriptionExpires,
     subscriptionId: 'sub_123',
     timestamp: '2025-01-01T00:00:00.000Z',
@@ -41,12 +69,30 @@ function createRecord(overrides: Partial<SubscriptionRecord> = {}): Subscription
   }
 }
 
+async function createCredential(challenge: Challenge.Challenge, source = rootAccount.address) {
+  const keyAuthorization = await signSubscriptionKeyAuthorization({
+    accessKey,
+    account: rootAccount,
+    chainId,
+    request: challenge.request as ReturnType<typeof Methods.subscription.schema.request.parse>,
+  })
+  if (!keyAuthorization) throw new Error('expected key authorization')
+  return Credential.from({
+    challenge,
+    payload: {
+      signature: KeyAuthorization.serialize(keyAuthorization),
+      type: 'keyAuthorization',
+    },
+    source: `did:pkh:eip155:${chainId}:${source.toLowerCase()}`,
+  })
+}
+
 describe('tempo.subscription', () => {
   test('stores an activated subscription and reuses it on later requests', async () => {
     const store = Store.memory()
     const method = subscription({
       activate: async ({ request, resolved }) => ({
-        receipt: createReceipt('sub_123', '0xactivate'),
+        receipt: createReceipt('sub_123', hashActivate),
         subscription: createRecord({
           amount: request.amount,
           chainId: request.methodDetails?.chainId,
@@ -54,25 +100,25 @@ describe('tempo.subscription', () => {
           lookupKey: resolved.key,
           periodSeconds: request.periodSeconds,
           recipient: request.recipient,
-          reference: '0xactivate',
+          reference: hashActivate,
           subscriptionExpires: request.subscriptionExpires,
         }),
       }),
-      amount: '10',
-      chainId: 4217,
-      currency: '0x20c0000000000000000000000000000000000001',
-      periodSeconds: '3600',
-      recipient: '0x1234567890abcdef1234567890abcdef12345678',
+      amount: subscriptionAmount,
+      chainId,
+      currency: subscriptionCurrency,
+      periodSeconds: subscriptionPeriodSeconds,
+      recipient: subscriptionRecipient,
       resolve: async ({ input }) => {
         const key = input.headers.get('X-Subscription-Key')
-        return key ? { key } : null
+        return key ? { accessKey, key } : null
       },
       store,
       subscriptionExpires: activeSubscriptionExpires,
     })
 
     const mppx = Mppx.create({ methods: [method], realm, secretKey })
-    const challengeResult = await mppx['tempo/subscription']({})(
+    const challengeResult = await mppx.tempo.subscription({})(
       new Request('https://example.com/resource', {
         headers: { 'X-Subscription-Key': subscriptionKey },
       }),
@@ -82,13 +128,13 @@ describe('tempo.subscription', () => {
     if (challengeResult.status !== 402) throw new Error('expected activation challenge')
 
     const challenge = Challenge.fromResponse(challengeResult.challenge)
-    const credential = Credential.from({
-      challenge,
-      payload: { signature: '0x1234', type: 'keyAuthorization' },
-      source: 'did:pkh:eip155:4217:0x1234567890abcdef1234567890abcdef12345678',
+    expect(challenge.request.accessKey).toEqual({
+      ...accessKey,
+      accessKeyAddress: accessKey.accessKeyAddress.toLowerCase(),
     })
+    const credential = await createCredential(challenge)
 
-    const activated = await mppx['tempo/subscription']({})(
+    const activated = await mppx.tempo.subscription({})(
       new Request('https://example.com/resource', {
         headers: {
           Authorization: Credential.serialize(credential),
@@ -99,7 +145,7 @@ describe('tempo.subscription', () => {
 
     expect(activated.status).toBe(200)
 
-    const reused = await mppx['tempo/subscription']({})(
+    const reused = await mppx.tempo.subscription({})(
       new Request('https://example.com/resource', {
         headers: {
           'X-Subscription-Key': subscriptionKey,
@@ -125,14 +171,15 @@ describe('tempo.subscription', () => {
       createRecord({
         lookupKey: subscriptionKey,
         subscriptionId: 'sub_old',
-        reference: '0xold',
+        reference: hashOld,
         subscriptionExpires: expiredDate,
       }),
     )
 
     const method = subscription({
+      accessKey: async () => accessKey,
       activate: async ({ request, resolved }) => ({
-        receipt: createReceipt('sub_new', '0xnew'),
+        receipt: createReceipt('sub_new', hashActivate),
         subscription: createRecord({
           amount: request.amount,
           chainId: request.methodDetails?.chainId,
@@ -140,16 +187,16 @@ describe('tempo.subscription', () => {
           lookupKey: resolved.key,
           periodSeconds: request.periodSeconds,
           recipient: request.recipient,
-          reference: '0xnew',
+          reference: hashActivate,
           subscriptionExpires: request.subscriptionExpires,
           subscriptionId: 'sub_new',
         }),
       }),
-      amount: '10',
-      chainId: 4217,
-      currency: '0x20c0000000000000000000000000000000000001',
-      periodSeconds: '3600',
-      recipient: '0x1234567890abcdef1234567890abcdef12345678',
+      amount: subscriptionAmount,
+      chainId,
+      currency: subscriptionCurrency,
+      periodSeconds: subscriptionPeriodSeconds,
+      recipient: subscriptionRecipient,
       resolve: async () => ({ key: subscriptionKey }),
       store,
       subscriptionExpires: activeSubscriptionExpires,
@@ -157,20 +204,16 @@ describe('tempo.subscription', () => {
 
     const mppx = Mppx.create({ methods: [method], realm, secretKey })
 
-    const challengeResult = await mppx['tempo/subscription']({})(
+    const challengeResult = await mppx.tempo.subscription({})(
       new Request('https://example.com/resource'),
     )
     expect(challengeResult.status).toBe(402)
     if (challengeResult.status !== 402) throw new Error('expected challenge')
 
     const challenge = Challenge.fromResponse(challengeResult.challenge)
-    const credential = Credential.from({
-      challenge,
-      payload: { signature: '0x1234', type: 'keyAuthorization' },
-      source: 'did:pkh:eip155:4217:0x1234567890abcdef1234567890abcdef12345678',
-    })
+    const credential = await createCredential(challenge)
 
-    const activated = await mppx['tempo/subscription']({})(
+    const activated = await mppx.tempo.subscription({})(
       new Request('https://example.com/resource', {
         headers: {
           Authorization: Credential.serialize(credential),
@@ -188,29 +231,157 @@ describe('tempo.subscription', () => {
     expect(current?.subscriptionId).toBe('sub_new')
   })
 
+  test('rejects activation when the dynamic access key does not match the credential', async () => {
+    const store = Store.memory()
+    const activateCalls: unknown[] = []
+    const method = subscription({
+      accessKey: async () => ({
+        accessKeyAddress: accessAccount.address,
+        keyType: 'p256',
+      }),
+      activate: async (parameters) => {
+        activateCalls.push(parameters)
+        return {
+          receipt: createReceipt('sub_unused'),
+          subscription: createRecord({ subscriptionId: 'sub_unused' }),
+        }
+      },
+      amount: subscriptionAmount,
+      chainId,
+      currency: subscriptionCurrency,
+      periodSeconds: subscriptionPeriodSeconds,
+      recipient: subscriptionRecipient,
+      resolve: async () => ({ key: subscriptionKey }),
+      store,
+      subscriptionExpires: activeSubscriptionExpires,
+    })
+    const mppx = Mppx.create({ methods: [method], realm, secretKey })
+    const challengeResult = await mppx.tempo.subscription({})(
+      new Request('https://example.com/resource'),
+    )
+    if (challengeResult.status !== 402) throw new Error('expected activation challenge')
+
+    const challenge = Challenge.fromResponse(challengeResult.challenge)
+    const credential = await createCredential(challenge)
+    const rejected = await mppx.tempo.subscription({})(
+      new Request('https://example.com/resource', {
+        headers: { Authorization: Credential.serialize(credential) },
+      }),
+    )
+
+    expect(rejected.status).toBe(402)
+    expect(activateCalls.length).toBe(0)
+  })
+
+  test('rejects activation settlements that do not match the challenged request', async () => {
+    const store = Store.memory()
+    const subscriptions = SubscriptionStore.fromStore(store)
+    const method = subscription({
+      accessKey: async () => accessKey,
+      activate: async ({ request, resolved }) => ({
+        receipt: createReceipt('sub_bad', hashActivate),
+        subscription: createRecord({
+          amount: String(BigInt(request.amount) + 1n),
+          chainId: request.methodDetails?.chainId,
+          currency: request.currency,
+          lookupKey: resolved.key,
+          periodSeconds: request.periodSeconds,
+          recipient: request.recipient,
+          reference: hashActivate,
+          subscriptionExpires: request.subscriptionExpires,
+          subscriptionId: 'sub_bad',
+        }),
+      }),
+      amount: subscriptionAmount,
+      chainId,
+      currency: subscriptionCurrency,
+      periodSeconds: subscriptionPeriodSeconds,
+      recipient: subscriptionRecipient,
+      resolve: async () => ({ key: subscriptionKey }),
+      store,
+      subscriptionExpires: activeSubscriptionExpires,
+    })
+    const mppx = Mppx.create({ methods: [method], realm, secretKey })
+    const challengeResult = await mppx.tempo.subscription({})(
+      new Request('https://example.com/resource'),
+    )
+    if (challengeResult.status !== 402) throw new Error('expected activation challenge')
+
+    const challenge = Challenge.fromResponse(challengeResult.challenge)
+    const credential = await createCredential(challenge)
+    const rejected = await mppx.tempo.subscription({})(
+      new Request('https://example.com/resource', {
+        headers: { Authorization: Credential.serialize(credential) },
+      }),
+    )
+
+    expect(rejected.status).toBe(402)
+    expect(await subscriptions.getByKey(subscriptionKey)).toBe(null)
+  })
+
+  test('rejects credentials whose declared source does not match the key authorization signer', async () => {
+    const store = Store.memory()
+    const activateCalls: unknown[] = []
+    const method = subscription({
+      accessKey: async () => accessKey,
+      activate: async (parameters) => {
+        activateCalls.push(parameters)
+        return {
+          receipt: createReceipt('sub_unused'),
+          subscription: createRecord({ subscriptionId: 'sub_unused' }),
+        }
+      },
+      amount: subscriptionAmount,
+      chainId,
+      currency: subscriptionCurrency,
+      periodSeconds: subscriptionPeriodSeconds,
+      recipient: subscriptionRecipient,
+      resolve: async () => ({ key: subscriptionKey }),
+      store,
+      subscriptionExpires: activeSubscriptionExpires,
+    })
+    const mppx = Mppx.create({ methods: [method], realm, secretKey })
+    const challengeResult = await mppx.tempo.subscription({})(
+      new Request('https://example.com/resource'),
+    )
+    if (challengeResult.status !== 402) throw new Error('expected activation challenge')
+
+    const challenge = Challenge.fromResponse(challengeResult.challenge)
+    const credential = await createCredential(challenge, otherAccessAccount.address)
+    const rejected = await mppx.tempo.subscription({})(
+      new Request('https://example.com/resource', {
+        headers: { Authorization: Credential.serialize(credential) },
+      }),
+    )
+
+    expect(rejected.status).toBe(402)
+    expect(activateCalls.length).toBe(0)
+  })
+
   test('renews an overdue matching subscription before falling back to 402', async () => {
     const store = Store.memory()
     const subscriptions = SubscriptionStore.fromStore(store)
     const renewCalls: number[] = []
     const method = subscription({
+      accessKey: async () => accessKey,
       activate: async () => ({
         receipt: createReceipt('unused'),
         subscription: createRecord({ subscriptionId: 'unused' }),
       }),
-      amount: '10',
-      chainId: 4217,
-      currency: '0x20c0000000000000000000000000000000000001',
-      periodSeconds: '3600',
-      recipient: '0x1234567890abcdef1234567890abcdef12345678',
+      amount: subscriptionAmount,
+      chainId,
+      currency: subscriptionCurrency,
+      periodSeconds: subscriptionPeriodSeconds,
+      recipient: subscriptionRecipient,
       resolve: async () => ({ key: subscriptionKey }),
       renew: async ({ periodIndex, subscription }) => {
         renewCalls.push(periodIndex)
         return {
-          receipt: createReceipt(subscription.subscriptionId, '0xrenewed'),
+          receipt: createReceipt(subscription.subscriptionId, hashRenewed),
           subscription: {
             ...subscription,
             lastChargedPeriod: periodIndex,
-            reference: '0xrenewed',
+            reference: hashRenewed,
           },
         }
       },
@@ -223,13 +394,13 @@ describe('tempo.subscription', () => {
         billingAnchor: new Date(Date.now() - 3 * 3_600_000).toISOString(),
         lastChargedPeriod: 0,
         lookupKey: subscriptionKey,
-        reference: '0xstale',
+        reference: hashStale,
         subscriptionId: 'sub_due',
       }),
     )
 
     const mppx = Mppx.create({ methods: [method], realm, secretKey })
-    const result = await mppx['tempo/subscription']({})(
+    const result = await mppx.tempo.subscription({})(
       new Request('https://example.com/resource', {
         headers: { 'X-Subscription-Key': subscriptionKey },
       }),
@@ -241,7 +412,7 @@ describe('tempo.subscription', () => {
     if (result.status !== 200) throw new Error('expected renewal success')
 
     const receipt = Receipt.fromResponse(result.withReceipt(new Response('OK')))
-    expect(receipt.reference).toBe('0xrenewed')
+    expect(receipt.reference).toBe(hashRenewed)
     expect(receipt.subscriptionId).toBe('sub_due')
   })
 
@@ -255,20 +426,20 @@ describe('tempo.subscription', () => {
         billingAnchor: new Date(Date.now() - 3 * 3_600_000).toISOString(),
         lastChargedPeriod: 0,
         lookupKey: subscriptionKey,
-        reference: '0xstale',
+        reference: hashStale,
         subscriptionId: 'sub_background',
       }),
     )
 
-    const result = await charge({
+    const result = await renew({
       renew: async ({ periodIndex, subscription }) => {
         renewCalls.push(periodIndex)
         return {
-          receipt: createReceipt(subscription.subscriptionId, '0xbackground'),
+          receipt: createReceipt(subscription.subscriptionId, hashBackground),
           subscription: {
             ...subscription,
             lastChargedPeriod: periodIndex,
-            reference: '0xbackground',
+            reference: hashBackground,
           },
         }
       },
@@ -276,8 +447,8 @@ describe('tempo.subscription', () => {
       subscriptionId: 'sub_background',
     })
 
-    expect(result?.receipt.reference).toBe('0xbackground')
+    expect(result?.receipt.reference).toBe(hashBackground)
     expect(renewCalls.length).toBe(1)
-    expect((await subscriptions.get('sub_background'))?.reference).toBe('0xbackground')
+    expect((await subscriptions.get('sub_background'))?.reference).toBe(hashBackground)
   })
 })

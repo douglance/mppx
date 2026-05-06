@@ -1,18 +1,19 @@
-import { formatUnits, type Address } from 'viem'
-import { Actions } from 'viem/tempo'
+import { isAddressEqual, type Address } from 'viem'
 
 import { VerificationFailedError } from '../../Errors.js'
 import type { LooseOmit, MaybePromise, NoExtraKeys } from '../../internal/types.js'
 import * as Method from '../../Method.js'
-import type * as Html from '../../server/internal/html/config.js'
 import * as Store from '../../Store.js'
 import * as Client from '../../viem/Client.js'
-import type * as z from '../../zod.js'
 import * as Account from '../internal/account.js'
 import * as defaults from '../internal/defaults.js'
 import * as Proof from '../internal/proof.js'
 import type * as types from '../internal/types.js'
 import * as Methods from '../Methods.js'
+import {
+  assertSubscriptionTiming,
+  verifySubscriptionKeyAuthorization,
+} from '../subscription/KeyAuthorization.js'
 import * as SubscriptionReceipt from '../subscription/Receipt.js'
 import * as SubscriptionStore from '../subscription/Store.js'
 import type {
@@ -22,7 +23,8 @@ import type {
   SubscriptionRecord,
   SubscriptionReceipt as SubscriptionReceiptValue,
 } from '../subscription/Types.js'
-import { html as htmlContent } from './internal/html.gen.js'
+
+type SubscriptionRequest = ReturnType<typeof Methods.subscription.schema.request.parse>
 
 /**
  * Creates a Tempo subscription method for recurring TIP-20 token payments.
@@ -38,14 +40,15 @@ export function subscription<const parameters extends subscription.Parameters>(
       'tempo.subscription() requires a `store` so subscriptions can be reused and renewed.',
     )
   }
-
+  if (typeof parameters.store.update !== 'function') {
+    throw new Error('tempo.subscription() requires an atomic store with `update`.')
+  }
   const {
     amount,
     currency = defaults.resolveCurrency(parameters),
     decimals = defaults.decimals,
     description,
     externalId,
-    html,
     periodSeconds,
     store: rawStore,
     subscriptionExpires,
@@ -71,21 +74,6 @@ export function subscription<const parameters extends subscription.Parameters>(
       subscriptionExpires,
     } as unknown as Defaults,
 
-    html: html
-      ? {
-          config: {
-            accessKey: html.accessKey,
-          },
-          content: htmlContent,
-          formatAmount: async (request: z.output<typeof Methods.subscription.schema.request>) => {
-            const amount = await formatHtmlAmount({ getClient, request })
-            return `${amount} / ${formatBillingInterval(request.periodSeconds)}`
-          },
-          text: html.text,
-          theme: html.theme,
-        }
-      : undefined,
-
     async authorize({ input, request }) {
       const resolved = await parameters.resolve({ input, request })
       if (!resolved) return undefined
@@ -97,13 +85,24 @@ export function subscription<const parameters extends subscription.Parameters>(
       if (periodIndex > subscription.lastChargedPeriod) {
         if (!parameters.renew) return undefined
 
-        const renewed = await parameters.renew({
+        const renewal = await settleRenewal({
+          expectedLookupKey: resolved.key,
           periodIndex,
+          renew: parameters.renew,
+          request,
+          store,
           subscription,
         })
-        await store.put(renewed.subscription)
+        if (!renewal) return undefined
+        if (renewal.status === 'charged') return { receipt: renewal.receipt }
+
+        await parameters.hooks?.renewed?.({
+          periodIndex,
+          receipt: renewal.result.receipt,
+          subscription: renewal.result.subscription,
+        })
         return {
-          receipt: renewed.receipt,
+          receipt: renewal.result.receipt,
         }
       }
 
@@ -112,16 +111,32 @@ export function subscription<const parameters extends subscription.Parameters>(
       }
     },
 
-    async request({ request }) {
+    async request({ capturedRequest, credential, request }) {
       const chainId = await (async () => {
         if (request.chainId) return request.chainId
         if (parameters.chainId) return parameters.chainId
         if (parameters.testnet) return defaults.chainId.testnet
         return (await getClient({})).chain?.id ?? defaults.chainId.mainnet
       })()
+      const parsedRequest = Methods.subscription.schema.request.parse({
+        ...request,
+        chainId,
+      })
+      const input = capturedRequest
+        ? new Request(capturedRequest.url, {
+            headers: capturedRequest.headers,
+            method: capturedRequest.method,
+          })
+        : new Request('https://subscription.invalid')
+      const resolved = await parameters.resolve({ input, request: parsedRequest })
+      const accessKey =
+        resolved && !credential
+          ? await resolveAccessKey({ input, parameters, request: parsedRequest, resolved })
+          : parsedRequest.accessKey
 
       return {
         ...request,
+        ...(accessKey ? { accessKey } : {}),
         chainId,
       }
     },
@@ -131,7 +146,6 @@ export function subscription<const parameters extends subscription.Parameters>(
     },
 
     async verify({ credential, envelope, request }) {
-      const source = credential.source ? Proof.parseProofSource(credential.source) : null
       const input = envelope
         ? new Request(envelope.capturedRequest.url, {
             headers: envelope.capturedRequest.headers,
@@ -139,32 +153,132 @@ export function subscription<const parameters extends subscription.Parameters>(
           })
         : new Request('https://subscription.invalid')
       const parsedRequest = Methods.subscription.schema.request.parse(request)
+      assertSubscriptionTiming({
+        challengeExpires: credential.challenge.expires,
+        request: parsedRequest,
+      })
       const resolved = await parameters.resolve({ input, request: parsedRequest })
 
       if (!resolved) {
         throw new VerificationFailedError({ reason: 'subscription could not be resolved' })
       }
-
-      const activation = await parameters.activate({
-        credential: credential as typeof credential & {
-          payload: SubscriptionCredentialPayload
-        },
-        input,
+      const challengeRequest = credential.challenge.request as SubscriptionRequest
+      const accessKey =
+        challengeRequest.accessKey ??
+        parsedRequest.accessKey ??
+        (await resolveAccessKey({ input, parameters, request: parsedRequest, resolved }))
+      if (!accessKey) {
+        throw new VerificationFailedError({ reason: 'subscription accessKey is missing' })
+      }
+      const verified = verifySubscriptionKeyAuthorization({
+        accessKey,
+        chainId: parsedRequest.methodDetails?.chainId ?? defaults.chainId.mainnet,
+        payload: credential.payload as SubscriptionCredentialPayload,
         request: parsedRequest,
-        resolved,
-        source,
       })
-
-      if (activation.subscription.lookupKey !== resolved.key) {
-        throw new VerificationFailedError({
-          reason: 'subscription lookupKey does not match the resolved key',
-        })
+      const declaredSource = credential.source ? Proof.parseProofSource(credential.source) : null
+      if (
+        declaredSource &&
+        (declaredSource.chainId !== verified.source.chainId ||
+          !isAddressEqual(declaredSource.address, verified.source.address))
+      ) {
+        throw new VerificationFailedError({ reason: 'credential source does not match signature' })
       }
 
+      const activation = withSubscriptionAccessKey(
+        await parameters.activate({
+          accessKey,
+          credential: credential as typeof credential & {
+            payload: SubscriptionCredentialPayload
+          },
+          input,
+          request: parsedRequest,
+          resolved,
+          source: verified.source,
+        }),
+        accessKey,
+      )
+
+      validateSubscriptionSettlement(activation, {
+        expectedLookupKey: resolved.key,
+        expectedPeriodIndex: 0,
+        request: parsedRequest,
+      })
+
       await store.put(activation.subscription)
+      await parameters.hooks?.activated?.({
+        receipt: activation.receipt,
+        subscription: activation.subscription,
+      })
       return activation.receipt
     },
   })
+}
+
+async function resolveAccessKey(parameters: {
+  input: Request
+  parameters: subscription.Parameters
+  request: SubscriptionRequest
+  resolved: subscription.ResolvedSubscription
+}) {
+  const { input, parameters: subscriptionParameters, request, resolved } = parameters
+  return (
+    resolved.accessKey ??
+    (subscriptionParameters.accessKey
+      ? await subscriptionParameters.accessKey({ input, request, resolved })
+      : undefined)
+  )
+}
+
+async function settleRenewal(parameters: {
+  expectedLookupKey: string
+  periodIndex: number
+  renew: (parameters: {
+    periodIndex: number
+    subscription: SubscriptionRecord
+  }) => Promise<subscription.RenewalResult>
+  request?: SubscriptionRequest | undefined
+  store: SubscriptionStore.SubscriptionStore
+  subscription: SubscriptionRecord
+}): Promise<
+  | { status: 'charged'; receipt: SubscriptionReceiptValue }
+  | { status: 'renewed'; result: subscription.RenewalResult }
+  | null
+> {
+  const { expectedLookupKey, periodIndex, renew, request, store, subscription } = parameters
+  const started = await store.beginRenewal(subscription.subscriptionId, periodIndex)
+  if (started.status === 'charged') {
+    return { receipt: SubscriptionReceipt.fromRecord(started.subscription), status: 'charged' }
+  }
+  if (started.status !== 'started') return null
+
+  const renewed = withSubscriptionAccessKey(
+    await renew({ periodIndex, subscription: started.subscription }).catch(async (error) => {
+      await store.failRenewal(subscription.subscriptionId, periodIndex)
+      throw error
+    }),
+    started.subscription.accessKey,
+  )
+  validateSubscriptionSettlement(renewed, {
+    expectedLookupKey,
+    expectedPeriodIndex: periodIndex,
+    request,
+  })
+  await store.commitRenewal(renewed.subscription, periodIndex)
+  return { result: renewed, status: 'renewed' }
+}
+
+function withSubscriptionAccessKey<
+  result extends subscription.ActivationResult | subscription.RenewalResult,
+>(result: result, accessKey: SubscriptionAccessKey | undefined): result {
+  if (!accessKey || result.subscription.accessKey) return result
+  return {
+    ...result,
+    subscription: {
+      ...result.subscription,
+      accessKey,
+    },
+  }
 }
 
 function getPeriodIndex(subscription: SubscriptionRecord): number {
@@ -188,9 +302,117 @@ function isActive(subscription: SubscriptionRecord): boolean {
   return new Date(subscription.subscriptionExpires).getTime() > Date.now()
 }
 
-function subscriptionBinding(
-  request: ReturnType<typeof Methods.subscription.schema.request.parse>,
+function validateSubscriptionSettlement(
+  result: subscription.ActivationResult | subscription.RenewalResult,
+  options: {
+    expectedLookupKey: string
+    expectedPeriodIndex: number
+    request?: SubscriptionRequest | undefined
+  },
 ) {
+  const { receipt, subscription } = result
+  assertSubscriptionReceipt(receipt, subscription)
+  assertSubscriptionRecord(subscription, options)
+
+  if (options.request) {
+    assertSubscriptionRequestMatch(subscription, options.request)
+  }
+}
+
+function assertSubscriptionReceipt(
+  receipt: SubscriptionReceiptValue,
+  subscription: SubscriptionRecord,
+) {
+  if (receipt.method !== 'tempo' || receipt.status !== 'success') {
+    throw new VerificationFailedError({ reason: 'subscription receipt is invalid' })
+  }
+  if (receipt.subscriptionId !== subscription.subscriptionId) {
+    throw new VerificationFailedError({ reason: 'subscription receipt id mismatch' })
+  }
+  if (receipt.reference !== subscription.reference) {
+    throw new VerificationFailedError({ reason: 'subscription receipt reference mismatch' })
+  }
+  if (receipt.timestamp !== subscription.timestamp) {
+    throw new VerificationFailedError({ reason: 'subscription receipt timestamp mismatch' })
+  }
+  assertTransactionHash(receipt.reference, 'subscription reference must be a transaction hash')
+  assertValidDate(receipt.timestamp, 'subscription receipt timestamp is invalid')
+}
+
+function assertSubscriptionRecord(
+  subscription: SubscriptionRecord,
+  options: {
+    expectedLookupKey: string
+    expectedPeriodIndex: number
+  },
+) {
+  assertBase64Url(subscription.subscriptionId, 'subscriptionId must be base64url')
+  assertTransactionHash(subscription.reference, 'subscription reference must be a transaction hash')
+  const billingAnchor = assertValidDate(
+    subscription.billingAnchor,
+    'subscription billingAnchor is invalid',
+  )
+  const subscriptionExpires = assertValidDate(
+    subscription.subscriptionExpires,
+    'subscriptionExpires is invalid',
+  )
+
+  assertEqual(subscription.lookupKey, options.expectedLookupKey, {
+    reason: 'subscription lookupKey does not match the resolved key',
+  })
+  assertEqual(subscription.lastChargedPeriod, options.expectedPeriodIndex, {
+    reason: 'subscription lastChargedPeriod does not match the settled period',
+  })
+  if (billingAnchor >= subscriptionExpires) {
+    throw new VerificationFailedError({
+      reason: 'subscription billingAnchor must be before subscriptionExpires',
+    })
+  }
+}
+
+function assertSubscriptionRequestMatch(
+  subscription: SubscriptionRecord,
+  request: SubscriptionRequest,
+) {
+  const matches =
+    subscription.amount === request.amount &&
+    subscription.currency.toLowerCase() === request.currency.toLowerCase() &&
+    subscription.periodSeconds === request.periodSeconds &&
+    subscription.recipient.toLowerCase() === request.recipient.toLowerCase() &&
+    subscription.subscriptionExpires === request.subscriptionExpires
+
+  if (!matches) {
+    throw new VerificationFailedError({ reason: 'subscription record does not match request' })
+  }
+}
+
+function assertBase64Url(value: string, reason: string) {
+  if (!/^[A-Za-z0-9_-]+$/.test(value)) {
+    throw new VerificationFailedError({ reason })
+  }
+}
+
+function assertTransactionHash(value: string, reason: string) {
+  if (!/^0x[0-9a-fA-F]{64}$/.test(value)) {
+    throw new VerificationFailedError({ reason })
+  }
+}
+
+function assertValidDate(value: string, reason: string) {
+  const milliseconds = new Date(value).getTime()
+  if (!Number.isFinite(milliseconds)) {
+    throw new VerificationFailedError({ reason })
+  }
+  return milliseconds
+}
+
+function assertEqual<value>(actual: value, expected: value, options: { reason: string }) {
+  if (actual !== expected) {
+    throw new VerificationFailedError(options)
+  }
+}
+
+function subscriptionBinding(request: SubscriptionRequest) {
   return {
     amount: request.amount,
     chainId: request.methodDetails?.chainId,
@@ -201,68 +423,13 @@ function subscriptionBinding(
   }
 }
 
-async function formatHtmlAmount(parameters: {
-  getClient: ReturnType<typeof Client.getResolver>
-  request: z.output<typeof Methods.subscription.schema.request>
-}) {
-  const { getClient, request } = parameters
-
-  try {
-    const chainId = request.methodDetails?.chainId
-    if (chainId === undefined) throw new Error('no chainId')
-
-    const client = await getClient({ chainId })
-    const metadata = await Actions.token.getMetadata(client, {
-      token: request.currency as `0x${string}`,
-    })
-    const symbol =
-      new Intl.NumberFormat('en', {
-        style: 'currency',
-        currency: metadata.currency,
-        currencyDisplay: 'narrowSymbol',
-      })
-        .formatToParts(0)
-        .find((part) => part.type === 'currency')?.value ?? metadata.currency
-
-    return `${symbol}${formatUnits(BigInt(request.amount), metadata.decimals)}`
-  } catch {
-    return `$${request.amount}`
-  }
-}
-
-const SECONDS_PER_MINUTE = 60
-const SECONDS_PER_HOUR = 3_600
-const SECONDS_PER_DAY = 86_400
-const SECONDS_PER_WEEK = 604_800
-const SECONDS_PER_MONTH = 2_592_000
-const SECONDS_PER_YEAR = 31_536_000
-
-function formatBillingInterval(periodSeconds: string) {
-  switch (Number(periodSeconds)) {
-    case SECONDS_PER_MINUTE:
-      return 'minute'
-    case SECONDS_PER_HOUR:
-      return 'hour'
-    case SECONDS_PER_DAY:
-      return 'day'
-    case SECONDS_PER_WEEK:
-      return 'week'
-    case SECONDS_PER_MONTH:
-      return 'month'
-    case SECONDS_PER_YEAR:
-      return 'year'
-    default:
-      return `every ${periodSeconds}s`
-  }
-}
-
 /**
- * Charges an overdue subscription outside of the HTTP request path.
+ * Renews an overdue subscription outside of the HTTP request path.
  * Intended for cron jobs or background workers that bill subscriptions on a schedule.
  *
  * Returns the renewal result if the subscription was overdue, or `null` if already current.
  */
-export async function charge(parameters: charge.Parameters): Promise<charge.Result | null> {
+export async function renew(parameters: renew.Parameters): Promise<renew.Result | null> {
   const { renew, store: rawStore } = parameters
   const store = SubscriptionStore.fromStore(rawStore)
 
@@ -273,15 +440,20 @@ export async function charge(parameters: charge.Parameters): Promise<charge.Resu
   const periodIndex = getPeriodIndex(record)
   if (periodIndex <= record.lastChargedPeriod) return null
 
-  const renewed = await renew({ periodIndex, subscription: record })
-  await store.put(renewed.subscription)
-  return renewed
+  const renewal = await settleRenewal({
+    expectedLookupKey: record.lookupKey,
+    periodIndex,
+    renew,
+    store,
+    subscription: record,
+  })
+  return renewal?.status === 'renewed' ? renewal.result : null
 }
 
-export declare namespace charge {
-  /** Parameters for charging an overdue subscription outside the request path. */
+export declare namespace renew {
+  /** Parameters for renewing an overdue subscription outside the request path. */
   type Parameters = {
-    /** The subscription to charge. */
+    /** The subscription to renew. */
     subscriptionId: string
     /** Billing callback — same signature as the `renew` hook on {@link subscription}. */
     renew: (parameters: {
@@ -289,10 +461,10 @@ export declare namespace charge {
       subscription: SubscriptionRecord
     }) => Promise<subscription.RenewalResult>
     /** Store containing subscription records. */
-    store: Store.Store<Record<string, unknown>>
+    store: Store.AtomicStore<Record<string, unknown>>
   }
 
-  /** Renewal result returned by {@link charge}. */
+  /** Renewal result returned by {@link renew}. */
   type Result = subscription.RenewalResult
 }
 
@@ -313,38 +485,59 @@ export declare namespace subscription {
   }
 
   /** Request defaults supported by the subscription method. */
-  type Defaults = LooseOmit<Method.RequestDefaults<typeof Methods.subscription>, 'recipient'>
+  type Defaults = LooseOmit<
+    Method.RequestDefaults<typeof Methods.subscription>,
+    'accessKey' | 'recipient'
+  >
 
   /** Parameters for configuring a Tempo subscription method. */
   type Parameters = Account.resolve.Parameters &
     Client.getResolver.Parameters & {
+      accessKey?:
+        | ((parameters: {
+            input: Request
+            request: SubscriptionRequest
+            resolved: ResolvedSubscription
+          }) => MaybePromise<SubscriptionAccessKey>)
+        | undefined
       activate: (parameters: {
+        accessKey: SubscriptionAccessKey
         credential: {
           payload: SubscriptionCredentialPayload
           source?: string | undefined
         }
         input: Request
-        request: ReturnType<typeof Methods.subscription.schema.request.parse>
+        request: SubscriptionRequest
         resolved: ResolvedSubscription
         source: { address: Address; chainId: number } | null
       }) => Promise<ActivationResult>
-      html?:
+      hooks?:
         | {
-            accessKey: SubscriptionAccessKey
-            text?: Html.Text | undefined
-            theme?: Html.Theme | undefined
+            activated?:
+              | ((parameters: {
+                  receipt: SubscriptionReceiptValue
+                  subscription: SubscriptionRecord
+                }) => MaybePromise<void>)
+              | undefined
+            renewed?:
+              | ((parameters: {
+                  periodIndex: number
+                  receipt: SubscriptionReceiptValue
+                  subscription: SubscriptionRecord
+                }) => MaybePromise<void>)
+              | undefined
           }
         | undefined
       periodSeconds?: string | undefined
       resolve: (parameters: {
         input: Request
-        request: ReturnType<typeof Methods.subscription.schema.request.parse>
+        request: SubscriptionRequest
       }) => MaybePromise<ResolvedSubscription | null>
       renew?: (parameters: {
         periodIndex: number
         subscription: SubscriptionRecord
       }) => Promise<RenewalResult>
-      store: Store.Store<Record<string, unknown>>
+      store: Store.AtomicStore<Record<string, unknown>>
       testnet?: boolean | undefined
     } & Defaults
 

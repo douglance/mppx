@@ -8,6 +8,7 @@ export type SubscriptionAccessKey = {
 
 /** Request-scoped lookup key for the active subscription tied to a route. */
 export type SubscriptionLookup = {
+  accessKey?: SubscriptionAccessKey | undefined
   key: string
 }
 
@@ -18,6 +19,10 @@ export type SubscriptionRecord = {
   chainId?: number | undefined
   currency: Address | string
   externalId?: string | undefined
+  accessKey?: SubscriptionAccessKey | undefined
+  inFlightPeriod?: number | undefined
+  inFlightReference?: string | undefined
+  inFlightStartedAt?: string | undefined
   lastChargedPeriod: number
   lookupKey: string
   periodSeconds: string
