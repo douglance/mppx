@@ -28,6 +28,20 @@ const subscriptionAccessKey = z.object({
   keyType: z.enum(['p256', 'secp256k1', 'webAuthn']),
 })
 
+const subscriptionMethodDetails = z.object({
+  accessKey: z.optional(subscriptionAccessKey),
+  chainId: z.optional(z.number()),
+})
+
+const subscriptionExpires = z
+  .datetime()
+  .check(
+    z.refine(
+      (value) => new Date(value as string).getTime() % 1_000 === 0,
+      'subscriptionExpires must be representable as whole seconds',
+    ),
+  )
+
 const uint64String = z.string().check(
   z.regex(/^[1-9]\d*$/, 'Invalid periodSeconds'),
   z.refine((value) => {
@@ -255,22 +269,33 @@ export const subscription = Method.from({
           decimals: z.number(),
           description: z.optional(z.string()),
           externalId: z.optional(z.string()),
+          methodDetails: z.optional(subscriptionMethodDetails),
           periodSeconds: uint64String,
           recipient: normalizedAddress,
-          subscriptionExpires: z.datetime(),
+          subscriptionExpires,
         })
         .check(positiveParsedAmount('Subscription amount must be greater than 0')),
-      z.transform(({ amount, chainId, decimals, ...rest }) => ({
-        ...rest,
-        amount: parseUnits(amount, decimals).toString(),
-        ...(chainId !== undefined
-          ? {
-              methodDetails: {
-                chainId,
-              },
-            }
-          : {}),
-      })),
+      z.transform(({ accessKey, amount, chainId, decimals, methodDetails, ...rest }) => {
+        // Accept top-level convenience input, but serialize Tempo-specific fields under methodDetails.
+        const nextMethodDetails: {
+          accessKey?: z.infer<typeof subscriptionAccessKey> | undefined
+          chainId?: number | undefined
+        } = {
+          ...methodDetails,
+          ...(accessKey !== undefined && { accessKey }),
+          ...(chainId !== undefined && { chainId }),
+        }
+
+        return {
+          ...rest,
+          amount: parseUnits(amount, decimals).toString(),
+          ...(Object.keys(nextMethodDetails).length > 0
+            ? {
+                methodDetails: nextMethodDetails,
+              }
+            : {}),
+        }
+      }),
     ),
   },
 })

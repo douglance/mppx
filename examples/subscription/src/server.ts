@@ -6,7 +6,9 @@ const currency = '0x20c0000000000000000000000000000000000000' as const
 const planId = 'monthly'
 const pricePerSecond = '0.000001'
 const periodSeconds = '1'
-const subscriptionExpires = new Date(Date.now() + 30 * 24 * 60 * 60 * 1_000).toISOString()
+const subscriptionExpires = new Date(
+  Math.ceil((Date.now() + 30 * 24 * 60 * 60 * 1_000) / 1_000) * 1_000,
+).toISOString()
 
 const account = privateKeyToAccount(generatePrivateKey())
 const store = Store.memory()
@@ -14,7 +16,7 @@ const subscriptions = Subscription.fromStore(store)
 
 type AccessKeyEntry = Subscription.SubscriptionAccessKey
 
-const accessKeys = new Map<string, AccessKeyEntry>()
+const pendingAccessKeys = new Map<string, AccessKeyEntry>()
 let sequence = 0
 
 function subscriptionKey(userId: string) {
@@ -25,16 +27,20 @@ function getUserId(request: Request) {
   return request.headers.get('X-User-Id') ?? new URL(request.url).searchParams.get('userId')
 }
 
-function getAccessKey(key: string): AccessKeyEntry {
-  const existing = accessKeys.get(key)
-  if (existing) return existing
-
+function createAccessKey(): AccessKeyEntry {
   const accessAccount = privateKeyToAccount(generatePrivateKey())
-  const accessKey = {
+  return {
     accessKeyAddress: accessAccount.address,
     keyType: 'secp256k1',
   } as const
-  accessKeys.set(key, accessKey)
+}
+
+function getPendingAccessKey(key: string): AccessKeyEntry {
+  const existing = pendingAccessKeys.get(key)
+  if (existing) return existing
+
+  const accessKey = createAccessKey()
+  pendingAccessKeys.set(key, accessKey)
   return accessKey
 }
 
@@ -100,10 +106,10 @@ const mppx = Mppx.create({
         const userId = getUserId(input)
         if (!userId) return null
         const key = subscriptionKey(userId)
-        return { accessKey: getAccessKey(key), key }
+        return { accessKey: getPendingAccessKey(key), key }
       },
       renew: async ({ periodIndex, subscription }) => {
-        const accessKey = subscription.accessKey ?? getAccessKey(subscription.lookupKey)
+        const accessKey = subscription.accessKey ?? getPendingAccessKey(subscription.lookupKey)
         const reference = chargeWithAccessKey({
           accessKey,
           amount: subscription.amount,
@@ -125,6 +131,7 @@ const mppx = Mppx.create({
       subscriptionExpires,
       hooks: {
         activated: async ({ subscription }) => {
+          pendingAccessKeys.delete(subscription.lookupKey)
           console.log(`[subscription] activated ${subscription.subscriptionId}`)
         },
         renewed: async ({ periodIndex, subscription }) => {

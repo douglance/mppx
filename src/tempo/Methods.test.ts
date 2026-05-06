@@ -256,6 +256,10 @@ describe('subscription', () => {
 
   test('schema: validates request and encodes amount in base units', () => {
     const request = Methods.subscription.schema.request.parse({
+      accessKey: {
+        accessKeyAddress: '0xabcdefabcdefabcdefabcdefabcdefabcdefabcd',
+        keyType: 'secp256k1',
+      },
       amount: '10',
       chainId: 4217,
       currency: '0x20c0000000000000000000000000000000000001',
@@ -267,6 +271,11 @@ describe('subscription', () => {
 
     expect(request.amount).toBe('10000000')
     expect(request.methodDetails?.chainId).toBe(4217)
+    expect(request.methodDetails?.accessKey).toEqual({
+      accessKeyAddress: '0xabcdefabcdefabcdefabcdefabcdefabcdefabcd',
+      keyType: 'secp256k1',
+    })
+    expect('accessKey' in request).toBe(false)
   })
 
   test('schema: rejects non-numeric periodSeconds', () => {

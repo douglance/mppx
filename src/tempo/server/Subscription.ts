@@ -54,7 +54,9 @@ export function subscription<const parameters extends subscription.Parameters>(
     subscriptionExpires,
   } = parameters
 
-  const store = SubscriptionStore.fromStore(rawStore)
+  const store = SubscriptionStore.fromStore(rawStore, {
+    activationTimeoutMs: parameters.activationTimeoutMs,
+  })
   const getClient = Client.getResolver({
     getClient: parameters.getClient,
     rpcUrl: defaults.rpcUrl,
@@ -132,11 +134,19 @@ export function subscription<const parameters extends subscription.Parameters>(
       const accessKey =
         resolved && !credential
           ? await resolveAccessKey({ input, parameters, request: parsedRequest, resolved })
-          : parsedRequest.accessKey
+          : parsedRequest.methodDetails?.accessKey
 
+      // Challenges carry the server-generated key in methodDetails so the shared request shape stays spec-compatible.
       return {
         ...request,
-        ...(accessKey ? { accessKey } : {}),
+        ...(accessKey
+          ? {
+              methodDetails: {
+                ...request.methodDetails,
+                accessKey,
+              },
+            }
+          : {}),
         chainId,
       }
     },
@@ -164,8 +174,8 @@ export function subscription<const parameters extends subscription.Parameters>(
       }
       const challengeRequest = credential.challenge.request as SubscriptionRequest
       const accessKey =
-        challengeRequest.accessKey ??
-        parsedRequest.accessKey ??
+        challengeRequest.methodDetails?.accessKey ??
+        parsedRequest.methodDetails?.accessKey ??
         (await resolveAccessKey({ input, parameters, request: parsedRequest, resolved }))
       if (!accessKey) {
         throw new VerificationFailedError({ reason: 'subscription accessKey is missing' })
@@ -183,6 +193,28 @@ export function subscription<const parameters extends subscription.Parameters>(
           !isAddressEqual(declaredSource.address, verified.source.address))
       ) {
         throw new VerificationFailedError({ reason: 'credential source does not match signature' })
+      }
+
+      // Claim the challenge before activation so replayed credentials cannot reach the charge hook.
+      const activationClaimed = await store.claimActivation(credential.challenge.id)
+      if (!activationClaimed) {
+        throw new VerificationFailedError({
+          reason: 'subscription credential has already been used',
+        })
+      }
+
+      const existing = await store.getByKey(resolved.key)
+      if (existing && isActive(existing)) {
+        return SubscriptionReceipt.fromRecord(existing)
+      }
+
+      // Distinct challenges can target the same subscription key; serialize activation by key
+      // before the first-period charge hook so concurrent fresh credentials cannot double-charge.
+      const activationStarted = await store.beginActivation(resolved.key, credential.challenge.id)
+      if (activationStarted.status !== 'started') {
+        throw new VerificationFailedError({
+          reason: 'subscription activation is already in flight',
+        })
       }
 
       const activation = withSubscriptionAccessKey(
@@ -205,7 +237,15 @@ export function subscription<const parameters extends subscription.Parameters>(
         request: parsedRequest,
       })
 
-      await store.put(activation.subscription)
+      const activationCommitted = await store.commitActivation(
+        activation.subscription,
+        credential.challenge.id,
+      )
+      if (!activationCommitted) {
+        throw new VerificationFailedError({
+          reason: 'subscription activation claim mismatch',
+        })
+      }
       await parameters.hooks?.activated?.({
         receipt: activation.receipt,
         subscription: activation.subscription,
@@ -419,6 +459,7 @@ function subscriptionBinding(request: SubscriptionRequest) {
     amount: request.amount,
     chainId: request.methodDetails?.chainId,
     currency: request.currency,
+    externalId: request.externalId,
     periodSeconds: request.periodSeconds,
     recipient: request.recipient,
     subscriptionExpires: request.subscriptionExpires,
@@ -502,6 +543,11 @@ export declare namespace subscription {
             resolved: ResolvedSubscription
           }) => MaybePromise<SubscriptionAccessKey>)
         | undefined
+      /**
+       * Milliseconds before an in-flight activation lock can be replaced.
+       * Keeps concurrent activation safe while allowing recovery from abandoned attempts.
+       */
+      activationTimeoutMs?: number | undefined
       activate: (parameters: {
         accessKey: SubscriptionAccessKey
         credential: {

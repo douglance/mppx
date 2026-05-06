@@ -25,6 +25,46 @@ function createRecord(overrides: Partial<SubscriptionRecord> = {}): Subscription
 }
 
 describe('tempo subscription store', () => {
+  test('claims an activation challenge once', async () => {
+    const store = fromStore(Store.memory())
+
+    expect(await store.claimActivation('challenge-1')).toBe(true)
+    expect(await store.claimActivation('challenge-1')).toBe(false)
+    expect(await store.claimActivation('challenge-2')).toBe(true)
+  })
+
+  test('tracks a resolved lookup key activation until committed', async () => {
+    const store = fromStore(Store.memory())
+
+    expect(await store.beginActivation('user-1:plan:pro', 'challenge-1')).toEqual({
+      status: 'started',
+    })
+    expect(await store.beginActivation('user-1:plan:pro', 'challenge-2')).toEqual({
+      status: 'inFlight',
+    })
+
+    expect(await store.commitActivation(createRecord(), 'challenge-2')).toBe(false)
+    expect(await store.commitActivation(createRecord(), 'challenge-1')).toBe(true)
+
+    expect((await store.getByKey('user-1:plan:pro'))?.subscriptionId).toBe(subscriptionId)
+    expect(await store.beginActivation('user-1:plan:pro', 'challenge-3')).toEqual({
+      status: 'started',
+    })
+  })
+
+  test('replaces a stale activation marker after the timeout', async () => {
+    const store = fromStore(Store.memory(), { activationTimeoutMs: 0 })
+
+    expect(await store.beginActivation('user-1:plan:pro', 'challenge-1')).toEqual({
+      status: 'started',
+    })
+    expect(await store.beginActivation('user-1:plan:pro', 'challenge-2')).toEqual({
+      status: 'started',
+    })
+    expect(await store.commitActivation(createRecord(), 'challenge-1')).toBe(false)
+    expect(await store.commitActivation(createRecord(), 'challenge-2')).toBe(true)
+  })
+
   test('tracks an in-flight renewal and commits it once', async () => {
     const store = fromStore(Store.memory())
     await store.put(createRecord())

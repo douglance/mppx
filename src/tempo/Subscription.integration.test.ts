@@ -14,7 +14,9 @@ const secretKey = 'subscription-lifecycle-secret'
 const currency = '0x20c0000000000000000000000000000000000001'
 const recipient = '0x1234567890abcdef1234567890abcdef12345678'
 const periodSeconds = '2592000'
-const subscriptionExpires = new Date(Date.now() + 365 * 24 * 60 * 60 * 1_000).toISOString()
+const subscriptionExpires = new Date(
+  Math.ceil((Date.now() + 365 * 24 * 60 * 60 * 1_000) / 1_000) * 1_000,
+).toISOString()
 const userId = 'user-1'
 const planId = 'monthly'
 const subscriptionKey = `news:${userId}:${planId}`

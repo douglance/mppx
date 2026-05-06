@@ -8,6 +8,7 @@ import {
   getSubscriptionRpcAllowedCalls,
   getSubscriptionScopes,
   signSubscriptionKeyAuthorization,
+  toSubscriptionExpirySeconds,
   toSubscriptionPeriodSeconds,
   verifySubscriptionKeyAuthorization,
 } from './KeyAuthorization.js'
@@ -29,7 +30,9 @@ const accessKey = {
 const currency = '0x20c0000000000000000000000000000000000001'
 const recipient = '0x1234567890abcdef1234567890abcdef12345678'
 const otherRecipient = '0x2222222222222222222222222222222222222222'
-const subscriptionExpires = new Date(Date.now() + 365 * 24 * 60 * 60 * 1_000).toISOString()
+const subscriptionExpires = new Date(
+  Math.ceil((Date.now() + 365 * 24 * 60 * 60 * 1_000) / 1_000) * 1_000,
+).toISOString()
 
 function parseRequest(
   overrides: Partial<Parameters<typeof Methods.subscription.schema.request.parse>[0]> = {},
@@ -149,6 +152,12 @@ describe('tempo subscription key authorization', () => {
     expect(() => toSubscriptionPeriodSeconds('0')).toThrow('periodSeconds is invalid')
     expect(() => toSubscriptionPeriodSeconds(String(Number.MAX_SAFE_INTEGER + 1))).toThrow(
       'periodSeconds cannot be represented exactly by this Tempo client',
+    )
+  })
+
+  test('rejects subscription expiries that cannot be represented by Tempo key authorizations', () => {
+    expect(() => toSubscriptionExpirySeconds('2026-01-01T00:00:00.500Z')).toThrow(
+      'subscriptionExpires must be representable as whole seconds',
     )
   })
 

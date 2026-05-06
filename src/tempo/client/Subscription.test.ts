@@ -27,7 +27,13 @@ const accessKey = {
 
 type SubscriptionRequest = ReturnType<typeof Methods.subscription.schema.request.parse>
 
-function createChallenge(): Challenge.Challenge<SubscriptionRequest, 'subscription', 'tempo'> {
+function secondsFromNow(milliseconds: number) {
+  return new Date(Math.ceil((Date.now() + milliseconds) / 1_000) * 1_000).toISOString()
+}
+
+function createChallenge(
+  overrides: Partial<Pick<SubscriptionRequest, 'subscriptionExpires'>> = {},
+): Challenge.Challenge<SubscriptionRequest, 'subscription', 'tempo'> {
   const request = Methods.subscription.schema.request.parse({
     accessKey,
     amount: '1',
@@ -36,7 +42,8 @@ function createChallenge(): Challenge.Challenge<SubscriptionRequest, 'subscripti
     decimals: 6,
     periodSeconds: '3600',
     recipient,
-    subscriptionExpires: new Date(Date.now() + 86_400_000).toISOString(),
+    subscriptionExpires: secondsFromNow(86_400_000),
+    ...overrides,
   })
   return Challenge.from({
     id: 'test-challenge-id',
@@ -48,6 +55,34 @@ function createChallenge(): Challenge.Challenge<SubscriptionRequest, 'subscripti
 }
 
 describe('tempo.subscription client', () => {
+  test('rejects subscription expiry beyond the configured maximum', async () => {
+    const challenge = createChallenge({
+      subscriptionExpires: secondsFromNow(2 * 86_400_000),
+    })
+    const method = subscription({
+      account: selectedAccount,
+      maxSubscriptionExpires: new Date(Date.now() + 86_400_000),
+    })
+
+    await expect(method.createCredential({ challenge, context: {} })).rejects.toThrow(
+      'Subscription expiry exceeds maxSubscriptionExpires',
+    )
+  })
+
+  test('runs custom request validation before authorizing the access key', async () => {
+    const challenge = createChallenge()
+    const method = subscription({
+      account: selectedAccount,
+      validateRequest: () => {
+        throw new Error('unexpected subscription request')
+      },
+    })
+
+    await expect(method.createCredential({ challenge, context: {} })).rejects.toThrow(
+      'unexpected subscription request',
+    )
+  })
+
   test('rejects key authorizations signed by a different account', async () => {
     const challenge = createChallenge()
     const keyAuthorization = await signSubscriptionKeyAuthorization({

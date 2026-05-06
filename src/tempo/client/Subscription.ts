@@ -3,6 +3,7 @@ import { isAddressEqual, type Address } from 'viem'
 import { tempo as tempo_chain } from 'viem/chains'
 
 import * as Credential from '../../Credential.js'
+import type { MaybePromise } from '../../internal/types.js'
 import * as Method from '../../Method.js'
 import * as Account from '../../viem/Account.js'
 import * as Client from '../../viem/Client.js'
@@ -43,7 +44,8 @@ export function subscription(parameters: subscription.Parameters = {}) {
       const chainId = challenge.request.methodDetails?.chainId ?? defaults.chainId.mainnet
       const client = await getClient({ chainId })
       const account = getAccount(client, context)
-      const accessKey = context?.accessKey ?? parameters.accessKey ?? challenge.request.accessKey
+      const accessKey =
+        context?.accessKey ?? parameters.accessKey ?? challenge.request.methodDetails?.accessKey
       if (!accessKey) {
         throw new Error(
           'No `accessKey` provided. The subscription challenge must include `accessKey`, or the client must pass one to parameters/context.',
@@ -79,6 +81,12 @@ export function subscription(parameters: subscription.Parameters = {}) {
 
       toSubscriptionPeriodSeconds(challenge.request.periodSeconds)
       toSubscriptionExpirySeconds(challenge.request.subscriptionExpires)
+      // The Tempo key authorization expiry becomes recurring billing authority, so bound it before signing.
+      assertMaxSubscriptionExpires({
+        maxSubscriptionExpires: parameters.maxSubscriptionExpires,
+        subscriptionExpires: challenge.request.subscriptionExpires,
+      })
+      await parameters.validateRequest?.(challenge.request)
 
       const keyAuthorization = await authorizeAccessKey(client, {
         accessKey,
@@ -158,6 +166,27 @@ async function authorizeAccessKey(
   return KeyAuthorization.fromRpc(result.keyAuthorization)
 }
 
+function assertMaxSubscriptionExpires(parameters: {
+  maxSubscriptionExpires: subscription.Parameters['maxSubscriptionExpires']
+  subscriptionExpires: string
+}) {
+  const { maxSubscriptionExpires, subscriptionExpires } = parameters
+  if (maxSubscriptionExpires === undefined) return
+
+  const subscriptionExpiry = new Date(subscriptionExpires).getTime()
+  const maxExpiry =
+    typeof maxSubscriptionExpires === 'number'
+      ? maxSubscriptionExpires
+      : new Date(maxSubscriptionExpires).getTime()
+
+  if (!Number.isFinite(maxExpiry)) {
+    throw new Error('Invalid maxSubscriptionExpires')
+  }
+  if (subscriptionExpiry > maxExpiry) {
+    throw new Error(`Subscription expiry exceeds maxSubscriptionExpires: ${subscriptionExpires}`)
+  }
+}
+
 export declare namespace subscription {
   /** Parameters for creating a Tempo subscription credential. */
   type Parameters = Account.getResolver.Parameters &
@@ -167,5 +196,11 @@ export declare namespace subscription {
       expectedPeriodSeconds?: string | undefined
       expectedRecipients?: readonly Address[] | undefined
       maxAmount?: string | bigint | undefined
+      maxSubscriptionExpires?: string | number | Date | undefined
+      validateRequest?:
+        | ((
+            request: ReturnType<typeof Methods.subscription.schema.request.parse>,
+          ) => MaybePromise<void>)
+        | undefined
     }
 }

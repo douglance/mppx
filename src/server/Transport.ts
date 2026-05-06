@@ -197,6 +197,7 @@ export function http(): Http {
     respondReceipt({ receipt, response }) {
       const headers = new Headers(response.headers)
       headers.set('Payment-Receipt', Receipt.serialize(receipt))
+      setReceiptCacheControl(headers)
       return new Response(response.body, {
         status: response.status,
         statusText: response.statusText,
@@ -204,6 +205,30 @@ export function http(): Http {
       })
     },
   })
+}
+
+function setReceiptCacheControl(headers: Headers) {
+  const cacheControl = headers.get('Cache-Control')
+  if (!cacheControl) {
+    headers.set('Cache-Control', 'private')
+    return
+  }
+
+  const directives = cacheControl
+    .split(',')
+    .map((directive) => directive.trim())
+    .filter(Boolean)
+    .filter((directive) => {
+      const name = directive.split('=', 1)[0]?.trim().toLowerCase()
+      return name !== 'public' && name !== 's-maxage'
+    })
+  if (
+    !directives.some((directive) => directive.split('=', 1)[0]?.trim().toLowerCase() === 'private')
+  ) {
+    directives.push('private')
+  }
+
+  headers.set('Cache-Control', directives.join(', ') || 'private')
 }
 
 /**

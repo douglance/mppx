@@ -26,8 +26,13 @@ export function toSubscriptionExpirySeconds(subscriptionExpires: string): number
   if (!Number.isFinite(milliseconds)) {
     throw new VerificationFailedError({ reason: 'subscriptionExpires is invalid' })
   }
+  if (milliseconds % 1_000 !== 0) {
+    throw new VerificationFailedError({
+      reason: 'subscriptionExpires must be representable as whole seconds',
+    })
+  }
 
-  const seconds = Math.floor(milliseconds / 1_000)
+  const seconds = milliseconds / 1_000
   if (seconds <= 0 || !Number.isSafeInteger(seconds)) {
     throw new VerificationFailedError({
       reason: 'subscriptionExpires cannot be represented in a Tempo key authorization',

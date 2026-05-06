@@ -3,11 +3,20 @@ import type { SubscriptionRecord } from './Types.js'
 
 const defaultRecordPrefix = 'tempo:subscription:record:'
 const defaultKeyPrefix = 'tempo:subscription:key:'
+const defaultActivationPrefix = 'tempo:subscription:activation:'
+const defaultCredentialPrefix = 'tempo:subscription:credential:'
+const defaultActivationTimeoutMs = 15 * 60 * 1_000
 
 /** Subscription-aware wrapper around a generic key-value store. */
 export type SubscriptionStore = {
+  /** Atomically marks a resolved subscription key as being activated. */
+  beginActivation: (lookupKey: string, challengeId: string) => Promise<BeginActivationResult>
   /** Atomically marks a subscription period as being renewed. */
   beginRenewal: (subscriptionId: string, periodIndex: number) => Promise<BeginRenewalResult>
+  /** Atomically claims a subscription activation challenge for single-use credentials. */
+  claimActivation: (challengeId: string) => Promise<boolean>
+  /** Stores an activated subscription and clears its in-flight activation marker. */
+  commitActivation: (subscription: SubscriptionRecord, challengeId: string) => Promise<boolean>
   /** Atomically stores a successful renewal and clears the in-flight marker. */
   commitRenewal: (subscription: SubscriptionRecord, periodIndex: number) => Promise<void>
   /** Clears an in-flight renewal marker after a failed renewal attempt. */
@@ -19,6 +28,9 @@ export type SubscriptionStore = {
   /** Upserts a subscription record and marks it as active for its lookup key. */
   put: (record: SubscriptionRecord) => Promise<void>
 }
+
+/** Result from attempting to mark a resolved subscription key as in-flight. */
+export type BeginActivationResult = { status: 'started' } | { status: 'inFlight' }
 
 /** Result from attempting to mark a subscription period as in-flight. */
 export type BeginRenewalResult =
@@ -34,16 +46,53 @@ export function fromStore(
 ): SubscriptionStore {
   const recordPrefix = options?.recordPrefix ?? defaultRecordPrefix
   const keyPrefix = options?.keyPrefix ?? defaultKeyPrefix
+  const activationPrefix = options?.activationPrefix ?? defaultActivationPrefix
+  const activationTimeoutMs = options?.activationTimeoutMs ?? defaultActivationTimeoutMs
+  const credentialPrefix = options?.credentialPrefix ?? defaultCredentialPrefix
 
   function recordKey(subscriptionId: string): string {
     return `${recordPrefix}${subscriptionId}`
+  }
+
+  function activationKey(key: string): string {
+    return `${activationPrefix}${key}`
+  }
+
+  function credentialKey(challengeId: string): string {
+    return `${credentialPrefix}${challengeId}`
   }
 
   function lookupKey(key: string): string {
     return `${keyPrefix}${key}`
   }
 
+  async function getByLookupKey(key: string): Promise<SubscriptionRecord | null> {
+    const id = (await store.get(lookupKey(key))) as string | null
+    if (!id) return null
+    return (await store.get(recordKey(id))) as SubscriptionRecord | null
+  }
+
   return {
+    async beginActivation(key, challengeId) {
+      return store.update(
+        activationKey(key),
+        (current): Store.Change<unknown, BeginActivationResult> => {
+          const marker = current as { startedAt?: string } | null
+          if (marker && !isStaleActivation(marker, activationTimeoutMs)) {
+            return { op: 'noop', result: { status: 'inFlight' as const } }
+          }
+          return {
+            op: 'set',
+            value: {
+              challengeId,
+              startedAt: new Date().toISOString(),
+            },
+            result: { status: 'started' as const },
+          }
+        },
+      )
+    },
+
     async beginRenewal(subscriptionId, periodIndex) {
       return store.update(
         recordKey(subscriptionId),
@@ -75,6 +124,40 @@ export function fromStore(
           }
         },
       )
+    },
+
+    async claimActivation(challengeId) {
+      return store.update(credentialKey(challengeId), (current) => {
+        // Challenge IDs are single-use for activation credentials.
+        if (current) return { op: 'noop', result: false }
+        return {
+          op: 'set',
+          value: { claimedAt: new Date().toISOString() },
+          result: true,
+        }
+      })
+    },
+
+    async commitActivation(subscription, challengeId) {
+      const claimed = await store.update(activationKey(subscription.lookupKey), (current) => {
+        const marker = current as { challengeId?: string; startedAt?: string } | null
+        if (marker?.challengeId !== challengeId) return { op: 'noop', result: false }
+        return {
+          op: 'set',
+          value: { ...marker, committingAt: new Date().toISOString() },
+          result: true,
+        }
+      })
+      if (!claimed) return false
+
+      await store.put(recordKey(subscription.subscriptionId), subscription)
+      await store.put(lookupKey(subscription.lookupKey), subscription.subscriptionId)
+      await store.update(activationKey(subscription.lookupKey), (current) => {
+        const marker = current as { challengeId?: string } | null
+        if (marker?.challengeId !== challengeId) return { op: 'noop', result: undefined }
+        return { op: 'delete', result: undefined }
+      })
+      return true
     },
 
     async commitRenewal(subscription, periodIndex) {
@@ -124,9 +207,7 @@ export function fromStore(
 
     /** Looks up the active subscription for a resolved request key. */
     async getByKey(key) {
-      const id = (await store.get(lookupKey(key))) as string | null
-      if (!id) return null
-      return (await store.get(recordKey(id))) as SubscriptionRecord | null
+      return getByLookupKey(key)
     },
 
     /** Upserts a subscription record and marks it as active for its lookup key. */
@@ -139,9 +220,22 @@ export function fromStore(
 
 export declare namespace fromStore {
   type Options = {
+    /** Key prefix for resolved subscription activation locks. @default `'tempo:subscription:activation:'` */
+    activationPrefix?: string | undefined
+    /** Milliseconds before a stuck activation lock can be replaced. @default `900000` */
+    activationTimeoutMs?: number | undefined
+    /** Key prefix for single-use activation credential markers. @default `'tempo:subscription:credential:'` */
+    credentialPrefix?: string | undefined
     /** Key prefix for subscription records. @default `'tempo:subscription:record:'` */
     recordPrefix?: string | undefined
     /** Key prefix for resolved request keys. @default `'tempo:subscription:key:'` */
     keyPrefix?: string | undefined
   }
+}
+
+function isStaleActivation(marker: { startedAt?: string }, timeoutMs: number) {
+  if (!Number.isFinite(timeoutMs) || timeoutMs < 0) return false
+  const startedAt = new Date(marker.startedAt ?? '').getTime()
+  if (!Number.isFinite(startedAt)) return true
+  return Date.now() - startedAt >= timeoutMs
 }
