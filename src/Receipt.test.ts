@@ -43,8 +43,8 @@ describe('from', () => {
 
     expect(receipt).toMatchInlineSnapshot(`
       {
-        "challengeId": "challenge-1",
         "chainId": 4326,
+        "challengeId": "challenge-1",
         "method": "evm",
         "reference": "0xabc123",
         "status": "success",
