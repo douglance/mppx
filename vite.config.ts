@@ -7,6 +7,9 @@ import { playwright } from 'vp/test/browser-playwright'
 const alias = {
   'mppx/client': path.resolve(import.meta.dirname, 'src/client'),
   'mppx/discovery': path.resolve(import.meta.dirname, 'src/discovery'),
+  'mppx/evm': path.resolve(import.meta.dirname, 'src/evm'),
+  'mppx/evm/client': path.resolve(import.meta.dirname, 'src/evm/client'),
+  'mppx/evm/server': path.resolve(import.meta.dirname, 'src/evm/server'),
   'mppx/mcp-sdk/client': path.resolve(import.meta.dirname, 'src/mcp-sdk/client'),
   'mppx/mcp-sdk/server': path.resolve(import.meta.dirname, 'src/mcp-sdk/server'),
   'mppx/proxy': path.resolve(import.meta.dirname, 'src/proxy'),
@@ -41,7 +44,12 @@ export default defineConfig({
           name: 'node',
           alias,
           include: ['src/**/*.test.ts'],
-          exclude: ['**/node_modules/**', 'src/**/*.browser.test.ts', 'src/cli/**/*.test.ts'],
+          exclude: [
+            '**/node_modules/**',
+            'src/**/*.browser.test.ts',
+            'src/cli/**/*.test.ts',
+            'src/evm/**/*.test.ts',
+          ],
           typecheck: {
             include: ['src/**/*.test-d.ts'],
           },
@@ -88,6 +96,17 @@ export default defineConfig({
             provider: playwright(),
             instances: [{ browser: 'chromium' }],
           },
+        },
+      },
+      {
+        test: {
+          name: 'evm',
+          alias,
+          include: ['src/evm/**/*.test.ts'],
+          globals: true,
+          retry: 1,
+          testTimeout: 60_000,
+          hookTimeout: 60_000,
         },
       },
     ],
